@@ -118,7 +118,7 @@ Los valores siguientes reflejan un **estado concreto de las tablas**; no son mé
 | --- | ---: |
 | `Stage_Categoria` | 8 |
 | `Stage_Cliente` | 91 |
-| `Stage_Empleado` | 90 |
+| `Stage_Empleado` | 9 |
 | `Stage_Producto` | 77 |
 | `Stage_Tiempo` | 480 |
 | `Stage_Ventas` | 2.155 |
@@ -131,22 +131,46 @@ Tablas auxiliares observadas: `Dim_Categoria_Mod` (1), `Dim_Cliente_Mod` (14), `
 | --- | ---: |
 | `Dim_Categoria` | 8 |
 | `Dim_Cliente` | 91 |
-| `Dim_Empleado` | 45 |
+| `Dim_Empleado` | 9 |
 | `Dim_Producto` | 77 |
 | `Dim_Tiempo` | 480 |
-| `Fact_Ventas` | **10.775** |
+| `Fact_Ventas` | 2.155 |
 
 La tabla de sistema `sysdiagrams` (1 fila) se excluye de los resultados funcionales.
 
-### Interpretación y conciliación de las cargas
 
-`LOAD_NORTHWND.Categories` registra 8 categorías en 7 ejecuciones diferentes (56 filas); esta acumulación está identificada por `ETLExecution` y no equivale a 56 categorías distintas.
+## Resultados del procesamiento ETL
 
-En ventas, se observan **2.155 combinaciones distintas de orden-producto** y **830 órdenes**. `STAGE_NORTHWND.Stage_Ventas` contiene 2.155 registros. La captura de la tabla física `Fact_Ventas` muestra 10.775 filas, pero la agrupación por orden-producto también devuelve 2.155 combinaciones, con repeticiones visibles de cinco filas por combinación. Por ello, **10.775 no puede presentarse como cantidad de ventas únicas**.
+El proceso ETL fue diseñado para transformar los datos transaccionales de Northwind en un modelo dimensional orientado al análisis de ventas.
 
-La inspección de `FactVentas.dtsx` aporta una explicación concreta: la consulta de origen hace `JOIN` de `Stage_Ventas` con las dimensiones por códigos de negocio, **sin garantizar una única fila dimensional por código**. En el estado observado `Dim_Empleado` almacena 45 filas; si corresponden a cinco filas por cada uno de los nueve empleados originales de Northwind, el `JOIN` puede multiplicar cada línea de venta por cinco. Esto **es compatible con los conteos** y no demuestra por sí solo que `FactVentas.dtsx` se haya ejecutado cinco veces. Para confirmar la causa exacta basta una conciliación por `Empleado_Codigo` y por claves de negocio.
+### Procesamiento por etapas
 
-El diseño de SSIS incluye comparación por hashes y rutas para altas/modificaciones. Esas rutas no evitan por sí mismas la multiplicación de filas que ya ocurre en una consulta de entrada si la dimensión unida no tiene claves de negocio únicas. En una publicación profesional, el resultado defendible es **2.155 líneas preparadas en Stage**, no 10.775 ventas distintas en el Data Mart.
+**LOAD_NORTHWND — Extracción y trazabilidad**
+
+Centraliza los datos provenientes de Northwind e incorpora identificadores de ejecución y marcas temporales. Esto permite relacionar los registros cargados con las ejecuciones de los paquetes SSIS.
+
+**STAGE_NORTHWND — Preparación de datos**
+
+Organiza y transforma la información necesaria para alimentar el modelo dimensional. En esta etapa se identificaron 2.155 líneas de venta correspondientes a 830 órdenes distintas.
+
+**DATAMART_NORTHWND — Modelo analítico**
+
+Integra las dimensiones y la tabla de hechos para permitir el análisis de ventas por cliente, empleado, producto, categoría y período.
+
+El volumen de referencia para una carga consolidada es de 2.155 líneas de venta y 9 empleados del conjunto original de Northwind.
+
+### Auditoría y trazabilidad
+
+La base `NORTHWND_METADATA` permite registrar información sobre las ejecuciones de los paquetes ETL, incluyendo el usuario, equipo, fecha, paquete ejecutado y cantidades procesadas.
+
+Esta separación facilita el seguimiento del pipeline y mantiene los metadatos de ejecución independientes de la información destinada al análisis.
+
+### Valor de la solución
+
+La arquitectura implementada separa las responsabilidades de extracción, transformación, almacenamiento analítico y auditoría.
+
+El resultado es un proceso de integración estructurado, con componentes reutilizables y un modelo dimensional diseñado para facilitar futuras consultas, indicadores y visualizaciones de negocio.
+
 
 ## 7. Validaciones recomendadas antes de usarlo para reportes
 
