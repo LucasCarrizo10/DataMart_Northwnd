@@ -1,75 +1,171 @@
-# Documentación técnica — Data Mart Northwind
+# Arquitectura y decisiones técnicas — Data Mart Northwind
 
-Esta documentación acompaña al [README principal](../README.md) y describe los procesos observables en los paquetes maestros y en `FactVentas.dtsx`.
+[← Volver al README](../README.md)
 
-## 1. Capas y responsabilidades
+Este documento amplía los detalles de implementación del [resumen principal](../README.md), sin repetir la presentación del proyecto. Se elaboró a partir de los **21 paquetes `.dtsx`**, los **21 scripts SQL** de Load, Stage y Data Mart, el script de metadatos y las consultas/capturas de SQL Server compartidas durante el desarrollo. Las cifras son resultados observados en las tablas; no se realizó una nueva ejecución independiente de todos los paquetes.
 
-| Base | Propósito |
-| --- | --- |
-| `LOAD_NORTHWND` | Carga de datos operacionales procedentes de Northwind. |
-| `STAGE_NORTHWND` | Preparación y transformación de datos intermedios. |
-| `DATAMART_NORTHWND` | Almacenamiento analítico dimensional. |
-| `NORTHWND_METADATA` | Entorno separado de metadatos; faltan definiciones de tablas y usos específicos. |
+## 1. Responsabilidades y recorrido
 
-El respaldo `Northwind.bak` constituye el punto de partida mencionado para el origen. Cada etapa cumple una responsabilidad distinta y permite analizar los problemas en el tramo correspondiente.
+| Etapa | Entrada | Transformación / objetivo | Salida |
+| --- | --- | --- | --- |
+| **Load** | Tablas operativas Northwind | Extracción y columnas `ETLLoad` / `ETLExecution` | `LOAD_NORTHWND` |
+| **Stage** | Registros seleccionados desde Load | Preparación de entidades, ventas y calendario; limpieza de tablas intermedias | `STAGE_NORTHWND` |
+| **Data Mart** | Tablas de Stage | Búsqueda de claves, comparación de cambios e inserción/actualización | `DATAMART_NORTHWND` |
+| **Metadata** | Eventos de paquetes SSIS | Inserciones y actualizaciones de conteos de ejecución | `NORTHWND_METADATA.dbo.ETLExecution` |
+
+La selección de ejecuciones de Load se apoya en `ETLExecution` (en varios scripts se consulta el `MAX(ETLExecution)`). Por eso es clave **distinguir filas almacenadas históricamente de filas de la carga seleccionada**.
 
 ## 2. Orquestación de paquetes
 
-### Carga inicial (`LoadMaster.dtsx`)
+Los tres proyectos reúnen siete paquetes cada uno (un maestro más seis unidades de trabajo):
+
+| Proyecto | Maestro | Paquetes especializados |
+| --- | --- | --- |
+| Load | `LoadMaster.dtsx` | `LoadEmployee`, `LoadProducts`, `LoadCategorie`, `LoadCustomer`, `LoadOrder`, `LoadOrderDetails` |
+| Stage | `StageMaster.dtsx` | `Stage_Empleado`, `Stage_Producto`, `Stage_Categories`, `Stage_Cliente`, `Stage_Ventas`, `Stage_Tiempo` |
+| Data Mart | `DataMartMaster.dtsx` | `DimEmpleado`, `DimCategoria`, `DimProducto`, `DimCliente`, `DimTiempo`, `FactVentas` |
+
+Las tareas **Execute Package Task** y sus restricciones de precedencia coordinan el orden. En el Data Mart, `FactVentas` se ejecuta después de las dimensiones para poder resolver las claves de referencia.
+
+<details>
+<summary>Ver orquestación de Load y Stage</summary>
 
 ![LoadMaster](../images/load-master.png)
 
-En el flujo se observan las tareas `LoadEmployee`, `LoadProducts`, `LoadCategorie`, `LoadCustomer`, `LoadOrder` y `LoadOrderDetails`. Las flechas verdes representan restricciones de precedencia configuradas entre tareas.
-
-### Staging (`StageMaster.dtsx`)
-
 ![StageMaster](../images/stage-master.png)
 
-El flujo muestra la secuencia `Stage Empleado` → `Stage Producto` → `Stage Categoria` → `Stage Cliente` → `Stage Ventas` → `Stage Tiempo`. Los paquetes de la solución están separados por entidad.
-
-### Data Mart (`DataMartMaster.dtsx`)
+</details>
 
 ![DataMartMaster](../images/datamart-master.png)
 
-Se aprecia la secuencia de carga de dimensiones —empleado, categoría, producto, cliente y tiempo— antes de la ejecución de `Fact Ventas`. El orden facilita que las búsquedas de claves dimensionales se realicen sobre dimensiones previamente cargadas.
+## 3. Transformaciones por etapa
 
-## 3. Modelo dimensional
+### Load: incorporación del origen y contexto de ejecución
 
-- `FactVentas`: tabla central de hechos de ventas.
-- `DimEmpleado`: contexto de empleado.
-- `DimCategoria`: contexto de categoría.
-- `DimProducto`: contexto de producto.
-- `DimCliente`: contexto de cliente.
-- `DimTiempo`: contexto temporal.
+Se cargan `Employees`, `Products`, `Categories`, `Customers`, `Orders` y `Order Details`. Los paquetes utilizan fuentes/destinos OLE DB, **Derived Column** y **Row Count**; las columnas de trazabilidad permiten asociar las filas a cargas específicas.
 
-**Pendiente de verificar en SQL:** grano de la tabla de hechos; claves subrogadas o naturales; relaciones y cardinalidades; métricas almacenadas; reglas para filas desconocidas o nulas.
+**Evidencia de la conservación por ejecución:** `Categories` registraba 56 filas. Una agrupación por `CategoryID` devolvió ocho identificadores distintos, cada uno presente siete veces y asociado a siete `ETLExecution` diferentes. Esto es consistente con siete cargas acumuladas; no debe confundirse con 56 categorías de negocio.
 
-## 4. Flujo de datos de `FactVentas.dtsx`
+### Stage: información preparada para el modelo
 
-![FactVentas](../images/fact-ventas-flujo.png)
+Se generan las tablas `Stage_Empleado`, `Stage_Producto`, `Stage_Categoria`, `Stage_Cliente`, `Stage_Ventas` y `Stage_Tiempo`. En los scripts aparecen normalizaciones de tipo de dato (por ejemplo, identificador de cliente), combinaciones de órdenes con su detalle y atributos derivados de fecha.
 
-La captura permite distinguir dos entradas de información, transformaciones previas, un `Merge Join`, un `Conditional Split` y dos rutas:
+Las tareas de control incluyen limpieza de staging, referencias a la ejecución de Load y registro de conteos. Existen también tablas auxiliares con sufijo `_Mod` utilizadas en el tratamiento de modificaciones de la fase dimensional.
 
-- **Registros nuevos:** se realizan consultas `Lookup` a dimensiones, se cuenta la cantidad de filas procesadas y se destinan al flujo de inserción en la tabla de hechos.
-- **Registros modificados:** se realizan búsquedas dimensionales, se cuenta la cantidad de filas y se continúa por pasos de inserción y actualización según los destinos identificados en la interfaz.
+### Data Mart: modelo de análisis
 
-La presencia de estos componentes confirma el diseño de dos recorridos. **No alcanza para demostrar** una estrategia SCD concreta, las reglas de comparación, cómo se evitan duplicados, el manejo de errores o la existencia de auditoría persistente: esos puntos requieren revisar las propiedades del paquete y/o ejecutar pruebas.
-
-## 5. Control Flow frente a Data Flow
-
-El **flujo de control** define qué tareas se ejecutan y bajo qué dependencias. El **flujo de datos** define cómo se extraen, unen, buscan y encaminan las filas dentro de una tarea específica.
-
-Esta separación hace que el proyecto sea más fácil de inspeccionar: cada paquete tiene una finalidad, y los paquetes maestros presentan el recorrido de ejecución de una etapa completa.
-
-## 6. Para completar la documentación con evidencia
-
-| Aspecto | Evidencia útil |
+| Tabla | Perspectiva analítica |
 | --- | --- |
-| Modelo estrella | Scripts de `CREATE TABLE` o diagrama de relaciones de SQL Server. |
-| Carga incremental | Condición de `Conditional Split` y columnas comparadas. |
-| Reglas de transformación | Configuración de transformaciones y consultas SQL dentro de los paquetes. |
-| Control de calidad | Manejo de errores, filas rechazadas, nulos y duplicados. |
-| Metadatos | Tablas y consultas de `NORTHWND_METADATA`. |
-| Resultado | Cantidades de filas por etapa y comprobaciones en destino. |
+| `Dim_Categoria` | Clasificación de productos |
+| `Dim_Cliente` | Cliente |
+| `Dim_Empleado` | Responsable/empleado |
+| `Dim_Producto` | Producto y atributos asociados |
+| `Dim_Tiempo` | Fecha y atributos de calendario |
+| `Fact_Ventas` | Hechos de ventas, cantidades, precios, descuentos y referencias dimensionales |
 
-Documentar esas evidencias permitiría describir con precisión las reglas de negocio y los criterios de actualización sin asumir funciones no verificadas.
+Las dimensiones tienen claves sustitutas `SKey`. `Fact_Ventas` identifica las referencias a cliente, empleado, producto y tiempo mediante búsquedas de dimensiones y conserva datos de pedidos y medidas. El script utiliza el número de orden y las claves dimensionales para identificar coincidencias; conviene tratar la combinación exacta como **clave lógica utilizada por el proceso**, sin afirmar que haya una restricción física de unicidad no verificada.
+
+## 4. Tratamiento de registros nuevos y modificados
+
+En los paquetes de dimensiones y en `FactVentas.dtsx` se observan componentes de comparación y bifurcación de flujos. El recorrido de `FactVentas` incluye:
+
+1. Lectura de registros desde Stage y desde el Data Mart.
+2. Obtención de valores `StageMD5` y `DataMartMD5`, seguida de `Merge Join`.
+3. `Conditional Split` para encaminar **registros nuevos** y **registros modificados**.
+4. `Lookup` contra las dimensiones en ambas rutas.
+5. `Row Count` y operaciones OLE DB de inserción/actualización.
+
+![Transformaciones de FactVentas](../images/fact-ventas-flujo.png)
+
+La comparación por hash permite detectar diferencias entre representaciones de registros. **No se presenta como SCD Tipo 2**: los scripts muestran principalmente actualización de valores existentes y no se ha identificado una estrategia completa de versionado histórico de dimensiones.
+
+## 5. Auditoría y observabilidad
+
+`NORTHWND_METADATA.dbo.ETLExecution` contiene:
+
+| Campo | Información registrada |
+| --- | --- |
+| `ID` | Identificador de registro de ejecución |
+| `UserName`, `MachineName` | Contexto de ejecución |
+| `PackageName` | Nombre del paquete |
+| `ETLLoad` | Fecha y hora |
+| `ETLCountRows` | Filas contabilizadas |
+| `ETLCountNewRegister` | Registros nuevos |
+| `ETLCountModifiedRegister` | Registros modificados |
+
+En los `.dtsx` hay **Execute SQL Task** para insertar la ejecución, recuperar su `ID` y actualizar contadores. Las capturas de `ETLExecution` muestran registros efectivos de distintos paquetes, con conteos poblados en algunas filas y `NULL` en otras. Por eso, la auditoría **existe y se usa**, pero los conteos no están completos en todas las ejecuciones registradas.
+
+**Precauciones al reutilizar la solución:** el script de metadatos elimina y recrea la base si ya existe (`DROP DATABASE`). Además, obtener `TOP(1) ID ... ORDER BY ID DESC` filtrando por paquete puede ser ambiguo si dos instancias del mismo paquete se ejecutan simultáneamente. En un entorno productivo convendría correlacionar por un ID de ejecución propagado entre tareas y evitar scripts destructivos.
+
+## 6. Conteos verificados en capturas de SQL Server
+
+Los valores siguientes reflejan un **estado concreto de las tablas**; no son métricas de rendimiento ni equivalen necesariamente a una sola corrida.
+
+### LOAD_NORTHWND
+
+| Tabla | Filas |
+| --- | ---: |
+| `Categories` | 56 |
+| `Customers` | 546 |
+| `Employees` | 90 |
+| `Order Details` | 12.930 |
+| `Orders` | 4.980 |
+| `Products` | 616 |
+
+### STAGE_NORTHWND
+
+| Tabla | Filas |
+| --- | ---: |
+| `Stage_Categoria` | 8 |
+| `Stage_Cliente` | 91 |
+| `Stage_Empleado` | 90 |
+| `Stage_Producto` | 77 |
+| `Stage_Tiempo` | 480 |
+| `Stage_Ventas` | 2.155 |
+
+Tablas auxiliares observadas: `Dim_Categoria_Mod` (1), `Dim_Cliente_Mod` (14), `Dim_Empleado_Mod` (65), `Dim_Producto_Mod` (1) y `Fact_Ventas_Mod` (0). No forman parte del volumen analítico principal.
+
+### DATAMART_NORTHWND
+
+| Tabla | Filas |
+| --- | ---: |
+| `Dim_Categoria` | 8 |
+| `Dim_Cliente` | 91 |
+| `Dim_Empleado` | 45 |
+| `Dim_Producto` | 77 |
+| `Dim_Tiempo` | 480 |
+| `Fact_Ventas` | **10.775** |
+
+La tabla de sistema `sysdiagrams` (1 fila) se excluye de los resultados funcionales.
+
+### Interpretación y conciliación de las cargas
+
+`LOAD_NORTHWND.Categories` registra 8 categorías en 7 ejecuciones diferentes (56 filas); esta acumulación está identificada por `ETLExecution` y no equivale a 56 categorías distintas.
+
+En ventas, se observan **2.155 combinaciones distintas de orden-producto** y **830 órdenes**. `STAGE_NORTHWND.Stage_Ventas` contiene 2.155 registros. La captura de la tabla física `Fact_Ventas` muestra 10.775 filas, pero la agrupación por orden-producto también devuelve 2.155 combinaciones, con repeticiones visibles de cinco filas por combinación. Por ello, **10.775 no puede presentarse como cantidad de ventas únicas**.
+
+La inspección de `FactVentas.dtsx` aporta una explicación concreta: la consulta de origen hace `JOIN` de `Stage_Ventas` con las dimensiones por códigos de negocio, **sin garantizar una única fila dimensional por código**. En el estado observado `Dim_Empleado` almacena 45 filas; si corresponden a cinco filas por cada uno de los nueve empleados originales de Northwind, el `JOIN` puede multiplicar cada línea de venta por cinco. Esto **es compatible con los conteos** y no demuestra por sí solo que `FactVentas.dtsx` se haya ejecutado cinco veces. Para confirmar la causa exacta basta una conciliación por `Empleado_Codigo` y por claves de negocio.
+
+El diseño de SSIS incluye comparación por hashes y rutas para altas/modificaciones. Esas rutas no evitan por sí mismas la multiplicación de filas que ya ocurre en una consulta de entrada si la dimensión unida no tiene claves de negocio únicas. En una publicación profesional, el resultado defendible es **2.155 líneas preparadas en Stage**, no 10.775 ventas distintas en el Data Mart.
+
+## 7. Validaciones recomendadas antes de usarlo para reportes
+
+Estas verificaciones ayudan a distinguir un pipeline funcional de un conjunto de indicadores confiables:
+
+- Conciliar filas por `ETLExecution` y clave de negocio, en vez de comparar solo conteos globales.
+- Verificar unicidad lógica de `Fact_Ventas` por la combinación de claves y número de orden definida en los scripts.
+- Revisar la expresión de importe `UnitPrice * Quantity - Discount` en el script de staging: en el modelo Northwind habitual `Discount` es una **fracción**, por lo que la lógica de negocio debe confirmarse antes de calcular ingresos definitivos.
+- Comprobar claves dimensionales faltantes, registros no asociados y consistencia de medidas.
+- En una nueva ejecución controlada, comparar conteos de entradas, altas, modificaciones y salidas con `ETLExecution`.
+
+Estas son recomendaciones de control de calidad **y no funcionalidades adicionales que se atribuyan al proyecto**.
+
+## 8. Reproducción y limitaciones del entorno
+
+1. Contar con SQL Server, Visual Studio y un proyecto de Integration Services compatible.
+2. Restaurar el origen Northwind y crear las bases de trabajo correspondientes (revisar scripts destructivos antes de ejecutarlos).
+3. Configurar administradores de conexión, variables, rutas y permisos según el equipo.
+4. Ejecutar y validar por etapas: `LoadMaster` → `StageMaster` → `DataMartMaster`.
+5. Revisar `ETLExecution`, totales y conciliaciones posteriores.
+
+Los `.dtsx` y scripts permiten inspeccionar la implementación. Las capturas aportan **evidencia de tablas pobladas y de ejecuciones registradas**; no se pretende que esta documentación sustituya pruebas reproducibles con un conjunto controlado de datos.

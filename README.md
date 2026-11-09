@@ -1,133 +1,97 @@
-# Data Mart Northwind | ETL y modelado dimensional con SSIS
+# Data Mart Northwind | ETL, modelado dimensional y trazabilidad
 
-**Proyecto de integración de datos y Data Warehousing desarrollado con SQL Server, SSIS y Visual Studio.**
+**SQL Server · SSIS · Visual Studio · Data Warehousing**
 
-A partir de los datos operacionales de **Northwind**, diseñé un proceso ETL por etapas y un **Data Mart de ventas con modelo estrella**, compuesto por una tabla de hechos (`FactVentas`) y dimensiones de análisis.
+Proyecto de práctica en el que diseñé e implementé un proceso de integración de datos a partir de **Northwind**, desde su extracción hasta un **Data Mart de ventas con modelo estrella**.
 
-El objetivo no fue únicamente trasladar registros: también busqué **separar responsabilidades entre capas, organizar dependencias de ejecución y diferenciar la inserción de registros nuevos de la actualización de registros existentes**.
+El desafío no era solamente trasladar datos entre bases: buscaba **transformar información transaccional en una estructura preparada para el análisis**, controlar el orden de las cargas, diferenciar registros nuevos de modificados y dejar evidencia de las ejecuciones.
 
-## Arquitectura de datos
+## La solución
 
 ```mermaid
 flowchart LR
-    O[Northwind / respaldo .bak] --> L[(LOAD_NORTHWND)]
+    O[(Northwind<br/>origen)] --> L[(LOAD_NORTHWND)]
     L --> S[(STAGE_NORTHWND)]
     S --> D[(DATAMART_NORTHWND)]
-    M[(NORTHWND_METADATA)] -.-> P[Metadatos de la solución]
+    L -. registro .-> M[(NORTHWND_METADATA)]
+    S -. registro .-> M
+    D -. registro .-> M
 ```
 
-| Base de datos | Rol |
+| Capa | Responsabilidad |
 | --- | --- |
-| `LOAD_NORTHWND` | Recepción de la información del origen Northwind. |
-| `STAGE_NORTHWND` | Capa intermedia de preparación y transformación de los datos. |
-| `DATAMART_NORTHWND` | Destino analítico con dimensiones y tabla de hechos. |
-| `NORTHWND_METADATA` | Base destinada a metadatos; los objetos y usos específicos no se detallan sin revisar su esquema. |
+| **LOAD** | Extraer y conservar las cargas del origen, identificadas con fecha y ejecución ETL. |
+| **STAGE** | Seleccionar los datos de carga, estandarizar atributos y preparar ventas y tiempo. |
+| **DATA MART** | Integrar dimensiones y hechos; distinguir altas de cambios existentes. |
+| **METADATA** | Registrar paquete, fecha, entorno y conteos de procesamiento. |
 
-La solución de **SSIS** se organizó en tres proyectos principales: `Load_Northwnd` (nombre en Visual Studio), `Stage_Northwnd` y `Data_Mart_Northwnd`.
+La orquestación se realizó con **tres proyectos de SSIS**, organizados en paquetes maestros (`LoadMaster`, `StageMaster`, `DataMartMaster`) y paquetes especializados. Las dependencias del flujo de control ordenan la ejecución y permiten cargar las dimensiones antes de la tabla de hechos.
 
-## Modelo estrella
+<details>
+<summary><strong>Ver los flujos maestros: Load y Stage</strong></summary>
+
+**Carga desde el origen**
+
+![Flujo de control LoadMaster](images/load-master.png)
+
+**Preparación de datos**
+
+![Flujo de control StageMaster](images/stage-master.png)
+
+</details>
+
+**Integración del Data Mart**
+
+![Flujo de control DataMartMaster](images/datamart-master.png)
+
+## Modelo dimensional
+
+El modelo organiza la información alrededor de `Fact_Ventas` y cinco dimensiones, para analizar las ventas desde distintas perspectivas sin depender directamente de las tablas operativas.
 
 ```mermaid
 flowchart TB
-    E[DimEmpleado] --> F[(FactVentas)]
-    C[DimCliente] --> F
-    P[DimProducto] --> F
-    G[DimCategoria] --> F
-    T[DimTiempo] --> F
+    F[(Fact_Ventas)]
+    C[Dim_Cliente] --> F
+    E[Dim_Empleado] --> F
+    P[Dim_Producto] --> F
+    G[Dim_Categoria] -. relación de categoría / producto .-> P
+    T[Dim_Tiempo] --> F
 ```
 
-**`FactVentas`** concentra los hechos de ventas, mientras que las dimensiones permiten explorar la información por **cliente, empleado, producto, categoría y tiempo**. Esta organización distingue los eventos de negocio de sus atributos descriptivos y facilita el análisis desde múltiples perspectivas.
+Las dimensiones utilizan **claves sustitutas (`SKey`)** para identificar sus registros. En la tabla de hechos se resuelven las referencias de cliente, empleado, producto y tiempo mediante búsquedas (*Lookup*). La categoría participa en el modelo por su relación con productos; el diagrama es conceptual y no sustituye el DDL físico.
 
-> El diagrama representa la organización conceptual del modelo. Las claves, cardinalidades, medidas y granularidad exacta requieren consultar las definiciones SQL del Data Mart.
+## Qué implementé en SSIS
 
-## Proceso ETL en SSIS
+- **Flujo de control:** ejecución organizada de paquetes y dependencias entre entidades.
+- **Flujo de datos:** orígenes y destinos OLE DB, columnas derivadas y contadores de filas.
+- **Preparación:** tratamiento de atributos, consolidación de órdenes y detalle de pedidos, y dimensión temporal.
+- **Detección de cambios:** comparación de datos con MD5, `Merge Join` y `Conditional Split` para distinguir registros nuevos y modificados.
+- **Integridad de referencias:** búsquedas `Lookup` contra las dimensiones antes de cargar `Fact_Ventas`.
+- **Trazabilidad:** tareas `Execute SQL Task` que registran ejecuciones y actualizan conteos en `NORTHWND_METADATA.dbo.ETLExecution`.
 
-### 1. Carga inicial — `LoadMaster.dtsx`
+### Ejemplo: carga de la tabla de hechos
 
-Los paquetes de esta etapa cargan las entidades de Northwind hacia la primera base del proceso. `LoadMaster.dtsx` coordina la ejecución de paquetes como `LoadEmployee`, `LoadProducts`, `LoadCategorie`, `LoadCustomer`, `LoadOrder` y `LoadOrderDetails`, conectados mediante restricciones de precedencia.
-
-<details>
-<summary><strong>Ver flujo de control de la carga inicial</strong></summary>
-
-![Flujo de control de LoadMaster](images/load-master.png)
-
-</details>
-
-### 2. Preparación — `StageMaster.dtsx`
-
-La capa de *staging* organiza el procesamiento intermedio con paquetes para empleados, productos, categorías, clientes, ventas y tiempo. El flujo maestro establece el orden de ejecución entre estos paquetes.
-
-<details>
-<summary><strong>Ver flujo de control de staging</strong></summary>
-
-![Flujo de control de StageMaster](images/stage-master.png)
-
-</details>
-
-### 3. Integración dimensional — `DataMartMaster.dtsx`
-
-El último proyecto carga las **dimensiones** y luego la **tabla de hechos**, respetando la secuencia de dependencias definida en el flujo de control.
-
-![Flujo de control del Data Mart](images/datamart-master.png)
-
-### 4. Registros nuevos y modificados — `FactVentas.dtsx`
-
-El flujo de datos de `FactVentas` combina información de entrada con datos ya existentes en el Data Mart y utiliza un **Conditional Split** para separar **registros nuevos** de **registros modificados**.
-
-En ambas rutas se observan búsquedas (*Lookup*) contra las dimensiones. Los registros nuevos se dirigen a una carga de inserción, mientras que los modificados continúan por un recorrido de actualización. Este diseño permite evitar tratar todas las filas como si fueran altas nuevas.
+En `FactVentas.dtsx` se comparan los datos preparados con los existentes en el destino y se separan las rutas de **inserción** y **actualización**. Cada ruta resuelve las claves dimensionales y contabiliza registros. Este diseño evita reducir la integración a una recarga indiscriminada de todas las filas.
 
 ![Flujo de datos de FactVentas](images/fact-ventas-flujo.png)
 
-> Los criterios exactos de detección de cambios, las expresiones utilizadas y la política de actualización deben verificarse dentro del paquete `.dtsx`.
+## Evidencia del procesamiento
 
-## Herramientas y conceptos aplicados
+Las consultas ejecutadas en SQL Server permiten observar **2.155 líneas de venta preparadas** en `STAGE_NORTHWND.Stage_Ventas`, correspondientes a **830 órdenes distintas**. También se construyeron las dimensiones de categoría (8), cliente (91), producto (77) y tiempo (480 registros observados).
 
-| Tecnología / concepto | Aplicación en el proyecto |
-| --- | --- |
-| SQL Server | Almacenamiento en las distintas capas del proceso. |
-| SSIS | Extracción, transformación, carga y orquestación. |
-| Visual Studio / SSDT | Desarrollo y organización de los paquetes. |
-| Control Flow | Secuenciación y dependencias entre tareas. |
-| Data Flow | Transformación y direccionamiento de registros. |
-| Lookups y Conditional Split | Correspondencia con dimensiones y separación de rutas de carga. |
-| Modelado dimensional | Estructura analítica con `FactVentas` y dimensiones. |
+Estos valores describen el volumen de datos preparado para el análisis, **sin confundir registros de distintas ejecuciones con ventas adicionales**. La solución incorpora flujos de comparación e inserción/actualización; sus detalles y las consideraciones de conciliación entre etapas están en la [documentación técnica](docs/ARQUITECTURA_ETL.md).
 
-## Estructura del repositorio
+## Por qué tomé estas decisiones
 
-```text
-DataMart_Northwnd/
-├── DataMart_Northwnd/       # Proyecto de carga (carpeta publicada)
-├── Stage_Northwnd/          # Proyecto de staging
-├── Data_Mart_Northwnd/      # Proyecto de Data Mart
-├── images/                  # Capturas documentales
-│   ├── load-master.png
-│   ├── stage-master.png
-│   ├── datamart-master.png
-│   └── fact-ventas-flujo.png
-├── docs/
-│   └── ARQUITECTURA_ETL.md
-├── DataMart_Northwnd.slnx
-└── README.md
-```
+La separación por capas facilita localizar problemas sin mezclar extracción, transformación y consulta analítica. El modelo dimensional organiza la información para análisis; la comparación de cambios evita tratar todas las filas como altas; y la base de metadatos permite conocer **qué paquete procesó datos y cuántos registros reportó**, sin contaminar las tablas de negocio con información operativa del ETL.
 
-## Cómo explorar la solución
+## Documentación y exploración
 
-1. Clonar o descargar este repositorio.
-2. Abrir la solución `DataMart_Northwnd.slnx` desde una instalación compatible de Visual Studio con soporte de SSIS.
-3. Revisar los administradores de conexión, parámetros y rutas de cada proyecto.
-4. Disponer de SQL Server y del origen Northwind; preparar las bases de datos requeridas.
-5. Inspeccionar los paquetes maestros y los flujos de datos individuales antes de ejecutar el proceso.
+- **[Arquitectura y decisiones técnicas](docs/ARQUITECTURA_ETL.md):** paquetes, transformaciones, auditoría, conteos, validaciones y límites observados.
+- **[Script de metadatos](scripts/NORTHWND_METADATA.sql):** definición de `dbo.ETLExecution` (atención: contiene instrucciones destructivas; leer antes de ejecutar).
 
-**Nota:** las conexiones locales, rutas y credenciales deben configurarse según el entorno. El repositorio no implica que la ejecución sea automática sin preparar los orígenes y destinos.
-
-## Documentación técnica
-
-Para revisar cada etapa, sus paquetes y las decisiones pendientes de verificación, consultar **[Arquitectura y procesos ETL](docs/ARQUITECTURA_ETL.md)**.
-
-## Aprendizajes
-
-Este proyecto me permitió poner en práctica el diseño de una arquitectura ETL por capas, la **construcción de un modelo dimensional** y la gestión de flujos de datos que contemplan tanto nuevas incorporaciones como cambios en registros existentes. También reforzó la importancia de que un pipeline sea comprensible y fácil de mantener, no solo funcional.
+Para explorar la solución, abrir `DataMart_Northwnd.slnx` en Visual Studio con soporte para proyectos SSIS, configurar las conexiones locales a SQL Server y revisar los paquetes maestros en el orden **Load → Stage → Data Mart**. El entorno de base de datos y sus credenciales deben configurarse por separado.
 
 ---
 
-**Proyecto personal de práctica** · SQL Server · SSIS · ETL · Data Warehousing · Modelado dimensional
+**Proyecto personal de práctica** · Integración de datos · ETL · SQL Server · SSIS · Modelo estrella · Auditoría de ejecuciones
