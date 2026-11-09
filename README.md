@@ -54,7 +54,7 @@ flowchart TB
     C[Dim_Cliente] --> F
     E[Dim_Empleado] --> F
     P[Dim_Producto] --> F
-    G[Dim_Categoria] -. relación de categoría / producto .-> P
+    G[Dim_Categoria] --> P
     T[Dim_Tiempo] --> F
 ```
 
